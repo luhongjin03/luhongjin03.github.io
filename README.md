@@ -301,4 +301,3 @@ for epoch in range(EPOCHS):
   - `.ddp_equalize(num_batches_per_epoch)`：确保在 DDP 运行时，各进程收到完全相同数量的 batches，避免训练不一致或 hang 现象。
 
 **注意**：在分布式训练中展示了在 DataLoader 中设置 `batch_size` 的方案。
-```
