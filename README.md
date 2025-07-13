@@ -239,7 +239,7 @@ shards = [f"/path/to/data-{i:05d}.tar" for i in range(NUM_SHARDS)]
 ```
 
 - **WebDataset pipeline**：
-
+Fluid接口：
 ```python
 dataset = (
     wds.WebDataset(shards,
@@ -254,7 +254,19 @@ dataset = (
     .with_epoch(EPOCH_LENGTH)  # 指定每 epoch 抽样总样本数
 )
 ```
-
+显式pipline：这里展示了使用ResampledShards的方案（相当于前面使用resampled=True, shardshuffle=True，实现shards之间顺序随机化），需要将tarfile_to_samples换成cached_tarfile_to_samples，前面一种方式没有tarfile_to_samples是因为被默认执行。
+```python
+dataset = wds.DataPipeline(
+    wds.ResampledShards(urls),
+    wds.cached_tarfile_to_samples(),  # Use cached version
+    wds.shuffle(shuffle_vals[0]),
+    wds.decode(wds.torch_audio),
+    wds.map(partial(callback, sample_size=sample_size, sample_rate=sample_rate, verbose=verbose, **kwargs)),
+    wds.shuffle(shuffle_vals[1]),
+    wds.to_tuple(audio_file_ext),
+    wds.batched(batch_size),
+).with_epoch(epoch_len)
+```
 - **WebLoader**：
 
 ```python
