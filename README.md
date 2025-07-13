@@ -301,3 +301,127 @@ for epoch in range(EPOCHS):
   - `.ddp_equalize(num_batches_per_epoch)`：确保在 DDP 运行时，各进程收到完全相同数量的 batches，避免训练不一致或 hang 现象。
 
 **注意**：在分布式训练中展示了在 DataLoader 中设置 `batch_size` 的方案。
+### 加上Ray
+``` python
+import os
+import sys
+import time
+import json
+import torch
+import ray
+import webdataset as wds
+from collections import deque
+from torch import nn
+from torch.nn.parallel import DistributedDataParallel
+from torchvision import transforms
+from torchvision.models import resnet50
+
+# 在训练函数外部初始化 Ray
+if not ray.is_initialized():
+    ray.init()
+
+@ray.remote(num_gpus=1)
+def train_on_ray(rank, config):
+    # 设置分布式环境变量
+    os.environ["MASTER_ADDR"] = config["master_addr"]
+    os.environ["MASTER_PORT"] = config["master_port"]
+    torch.distributed.init_process_group(
+        backend=config["backend"],
+        rank=rank,
+        world_size=config["world_size"]
+    )
+    config["rank"] = rank
+    train(config)
+
+def enumerate_report(seq, delta, growth=1.0):
+    last = 0
+    for count, item in enumerate(seq):
+        now = time.time()
+        if now - last > delta:
+            last = now
+            yield count, item, True
+        else:
+            yield count, item, False
+        delta *= growth
+
+def make_dataloader_train(batch_size, cache_dir):
+    transform = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+    ])
+    def make_sample(sample):
+        img = transform(sample["jpg"])
+        return img, sample["cls"]
+
+    trainset = (
+        wds.WebDataset(
+            "https://storage.googleapis.com/webdataset/fake-imagenet/imagenet-train-{000000..001281}.tar",
+            resampled=True, shardshuffle=True,
+            cache_dir=cache_dir,
+            nodesplitter=wds.split_by_node
+        )
+        .shuffle(1000)
+        .decode("pil")
+        .map(make_sample)
+        .batched(64)
+    )
+    loader = wds.WebLoader(trainset, batch_size=None, num_workers=4)
+    loader = loader.unbatched().shuffle(1000).batched(batch_size)
+    loader = loader.with_epoch((1282 * 100) // batch_size)
+    return loader
+
+def train(config):
+    model = resnet50(pretrained=False).cuda()
+    model = DistributedDataParallel(model)
+    optimizer = torch.optim.SGD(model.parameters(), lr=config["lr"], momentum=config["momentum"])
+    loss_fn = nn.CrossEntropyLoss()
+
+    loader = make_dataloader_train(config["batch_size"], config["cache_dir"])
+
+    losses = deque(maxlen=100)
+    accs = deque(maxlen=100)
+    steps = 0
+
+    for epoch in range(config["epochs"]):
+        for i, (inputs, labels), verbose in enumerate_report(loader, config["report_s"]):
+            inputs = inputs.cuda(non_blocking=True)
+            labels = labels.cuda(non_blocking=True)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = loss_fn(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            acc = (outputs.argmax(1) == labels).float().mean().item()
+            losses.append(loss.item())
+            accs.append(acc)
+            steps += labels.size(0)
+
+            if verbose:
+                print(f"[rank {config['rank']}] epoch {epoch} step {i} loss {sum(losses)/len(losses):.4f} acc {sum(accs)/len(accs):.4f}")
+
+            if steps >= config["max_steps"]:
+                print("Finished max_steps")
+                return
+    print(f"[rank {config['rank']}] Training complete, steps={steps}")
+
+if __name__ == "__main__":
+    config = {
+        "epochs": 10,
+        "max_steps": int(1e6),
+        "batch_size": 32,
+        "lr": 0.01,
+        "momentum": 0.9,
+        "world_size": min(2, ray.available_resources().get("GPU", 0)),
+        "backend": "nccl",
+        "master_addr": "127.0.0.1",
+        "master_port": "12355",
+        "report_s": 15.0,
+        "cache_dir": "./_cache"
+    }
+
+    # 异步启动多 GPU 训练进程
+    tasks = [train_on_ray.remote(rank, config) for rank in range(config["world_size"])]
+    ray.get(tasks)
+```
